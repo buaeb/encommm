@@ -8,17 +8,176 @@ import numpy as np
 # from multiprocessing import Pool, current_process
 
 
-def drivingForce(enm, mode):
+def drivingForce(enm, mode,memb_cut):
     w = enm.get_eigvalues()[mode-1]
     vec = enm.get_filtered_eigvecs_mat(transpose=False, n_vecs=1, start=mode-1)[0]
     F=0
     E=1000
     z=enm.get_xyz()
     for i in range(enm.get_n_masses()):
-        #if (z[i][2]>150) and (z[i][2]<202):
-        F+= E*vec[3*i+2]*enm.get_charge(i)
+        if (z[i][2]>-memb_cut) and (z[i][2]<memb_cut):
+            F+= E*vec[3*i+2]*enm.get_charge(i)
     Amp = F/w
     return Amp
+
+
+class ModeSet:
+    """Eigenvalues, eigenvectors, mass coordinates, charges and labels of a solved ENM, from an ENM object or from a
+    .npz cache (see ModeSet.save), so that the driving force analyses don't need to rebuild the model.
+
+    Attributes:
+        eigvals (numpy.ndarray): All eigenvalues (3n), lowest first.
+        eigvecs (numpy.ndarray): Eigenvectors in row format (3n x 3n).
+        xyz (numpy.ndarray): Coordinates of the masses (n x 3).
+        charges (numpy.ndarray): Charge of every mass (n).
+        labels (list): Mass labels, e.g. 'ARG.CA|330|A|321'.
+        chains (numpy.ndarray): Chain of every mass.
+        resnums (numpy.ndarray): Residue number of every mass.
+    """
+
+    def __init__(self, enm=None, npz_file=None):
+        if npz_file is not None:
+            data = np.load(npz_file)
+            self.eigvals, self.eigvecs = data["eigvals"], data["eigvecs"]
+            self.xyz, self.charges, self.labels = data["xyz"], data["charges"], list(data["labels"])
+        else:
+            self.eigvals, self.eigvecs = enm.eigvals, enm.eigvecs
+            self.xyz = enm.get_xyz()
+            self.charges = np.array([enm.get_charge(i) for i in range(enm.get_n_masses())], dtype=float)
+            self.labels = enm.get_mass_labels()
+        self.chains = np.array([l.split("|")[2] for l in self.labels])
+        self.resnums = np.array([int(l.split("|")[1]) for l in self.labels])
+
+    def save(self, npz_file):
+        np.savez(npz_file, eigvals=self.eigvals, eigvecs=self.eigvecs.astype(np.float32), xyz=self.xyz,
+                 charges=self.charges, labels=np.array(self.labels))
+
+
+def fieldProfile(z, V=1., half_thickness=15.6, width=2.0, center=None, sigma=4.0):
+    """Electric field E(z) along the membrane normal, normalized so that its integral over z equals V.
+
+    Args:
+        z (numpy.ndarray): z coordinates (Å). The membrane must be centered at z = 0 (OPM/PPM orientation).
+        V (float, optional): Membrane potential (relative units). Positive V pushes positive charges towards +z.
+        half_thickness (float, optional): Half thickness of the membrane (Å).
+        width (float, optional): Width of the smooth membrane edges (Å). 0 gives the sharp slab of drivingForce.
+        center (float, optional): If given, the field is a Gaussian focused at z = center instead of a slab.
+        sigma (float, optional): Standard deviation of the focused field (Å).
+
+    Returns:
+        numpy.ndarray: The field at every z.
+    """
+    z = np.asarray(z, dtype=float)
+    if center is not None:
+        return V * np.exp(-0.5 * ((z - center) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+    if width == 0:
+        return np.where(np.abs(z) < half_thickness, V / (2 * half_thickness), 0.)
+    grid = np.linspace(-half_thickness - 100., half_thickness + 100., 40001)
+    norm = np.trapezoid(1. / (1. + np.exp((np.abs(grid) - half_thickness) / width)), grid)
+    return V / (1. + np.exp((np.abs(z) - half_thickness) / width)) / norm
+
+
+def membraneForce(modes, neutralize=None, neutralize_chains=None, **profile):
+    """Force of the membrane field on every mass: f_i = q_i E(z_i) along z, as a 3n vector.
+
+    Args:
+        modes (ModeSet): The modes (for coordinates, charges and labels).
+        neutralize (list, optional): Residue numbers whose charge is set to 0 (in silico charge neutralization).
+        neutralize_chains (str, optional): Chains in which to neutralize them (default: all chains).
+        **profile: Passed to fieldProfile (V, half_thickness, width, center, sigma).
+
+    Returns:
+        numpy.ndarray: The 3n force vector.
+    """
+    q = modes.charges.copy()
+    if neutralize is not None:
+        sel = np.isin(modes.resnums, neutralize)
+        if neutralize_chains is not None:
+            sel &= np.isin(modes.chains, list(neutralize_chains))
+        q[sel] = 0.
+    f = np.zeros((len(q), 3))
+    f[:, 2] = q * fieldProfile(modes.xyz[:, 2], **profile)
+    return f.reshape(-1)
+
+
+def internalForce(modes, f, half_thickness=15.6):
+    """Removes from f the part that only moves the transmembrane block as a rigid body.
+
+    The net force and torque that f exerts on the masses within |z| < half_thickness are subtracted, so that
+    v . internalForce(f) measures the work done on charges moving relative to the transmembrane block (e.g. gating
+    charges moving through the membrane), not on the block's net charge.
+
+    Args:
+        modes (ModeSet): The modes (for coordinates).
+        f (numpy.ndarray): A 3n force vector (from membraneForce).
+        half_thickness (float, optional): Half thickness of the membrane (Å), defines the transmembrane block.
+
+    Returns:
+        numpy.ndarray: The 3n internal force vector.
+    """
+    tm = np.abs(modes.xyz[:, 2]) < half_thickness
+    rc = modes.xyz[tm] - modes.xyz[tm].mean(axis=0)
+    A = np.zeros((3 * tm.sum(), 6))  # rigid-body basis: 3 translations, 3 infinitesimal rotations
+    for k in range(3):
+        A[k::3, k] = 1.
+    A[0::3, 4], A[0::3, 5] = rc[:, 2], -rc[:, 1]
+    A[1::3, 3], A[1::3, 5] = -rc[:, 2], rc[:, 0]
+    A[2::3, 3], A[2::3, 4] = rc[:, 1], -rc[:, 0]
+    Q = np.linalg.qr(A)[0]
+    idx = (np.repeat(np.nonzero(tm)[0] * 3, 3) + np.tile(np.arange(3), tm.sum()))
+    f_int = f.copy()
+    f_int[idx] -= Q @ (Q.T @ f[idx])
+    return f_int
+
+
+def drivingForceDecomposed(modes, mode_indices=None, internal=True, neutralize=None, neutralize_chains=None,
+                           **profile):
+    """Decomposes the response of the modes to the membrane field.
+
+    For each mode k (eigenvector v_k, eigenvalue l_k) and the field force f:
+        coupling  = v_k . f            how much the mode moves charges through the field
+        amplitude = v_k . f / l_k      linear-response displacement along the mode (what drivingForce returns)
+        energy    = (v_k . f)^2 / l_k  energy released by the field along the mode (less biased to soft modes)
+    and the same three with the internal force (rigid motion of the transmembrane block removed) if internal is True.
+    Shares are fractions of the sum over all non-trivial modes. Mode numbers start at 1, as in drivingForce
+    (the first 6 are the rigid-body modes and are skipped).
+
+    Args:
+        modes (ModeSet): The modes.
+        mode_indices (list, optional): Mode numbers to report. Default: all non-trivial modes.
+        internal (bool, optional): If True, also computes the internal (gating) part.
+        neutralize (list, optional): Residue numbers whose charge is set to 0.
+        neutralize_chains (str, optional): Chains in which to neutralize them (default: all chains).
+        **profile: Passed to fieldProfile (V, half_thickness, width, center, sigma).
+
+    Returns:
+        dict: Arrays keyed by 'mode', 'eigval', 'coupling', 'amplitude', 'energy', 'amplitude_share',
+              'energy_share' and, if internal, the same keys with an '_internal' suffix. Also 'total_energy' and
+              'total_energy_internal' (sums over all non-trivial modes).
+    """
+    f = membraneForce(modes, neutralize=neutralize, neutralize_chains=neutralize_chains, **profile)
+    vals = modes.eigvals[6:]
+    vecs = modes.eigvecs[6:]
+    forces = {"": f}
+    if internal:
+        forces["_internal"] = internalForce(modes, f, half_thickness=profile.get("half_thickness", 15.6))
+    if mode_indices is None:
+        sel = np.arange(len(vals))
+    else:
+        sel = np.asarray(mode_indices) - 7
+    out = {"mode": sel + 7, "eigval": vals[sel]}
+    for suffix, force in forces.items():
+        coupling = vecs @ force
+        amplitude = coupling / vals
+        energy = coupling ** 2 / vals
+        out["coupling" + suffix] = coupling[sel]
+        out["amplitude" + suffix] = amplitude[sel]
+        out["energy" + suffix] = energy[sel]
+        out["amplitude_share" + suffix] = amplitude[sel] ** 2 / np.sum(amplitude ** 2)
+        out["energy_share" + suffix] = energy[sel] / np.sum(energy)
+        out["total_energy" + suffix] = np.sum(energy)
+    return out
+
 
 def get_transit_probs(enm_a, enm_b, gamma=1, alignment=None):
     """Computes the transition 'probabilities' of reaching state B from state A and vice versa.
