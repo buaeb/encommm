@@ -117,6 +117,8 @@ class ExENCoM(ENCoM):
             The reduced Hessian matrix (3n x 3n, n being the number of protein masses).
         """
         h_prot = super().build_hessian()
+        # the per-term Hessians are not needed anymore and take 4 times the memory of the Hessian
+        self.V1_H, self.V2_H, self.V3_H, self.V4_H = None, None, None, None
         prot_xyz = self._get_mass_xyz()
         self.membrane = build_membrane(prot_xyz, h=self.memb_h, R=self.memb_R, Ri=self.memb_Ri, r=self.node_r,
                                        lat=self.lattice, exr=self.exr, use_hull=self.use_hull)
@@ -129,7 +131,7 @@ class ExENCoM(ENCoM):
         if len(self.membrane) == 0:
             raise ValueError("No membrane node was built. The PDB file should be oriented as in OPM/PPM.")
         return reduce_membrane_hessian(h_prot, prot_xyz, self.membrane, cutoff=self.memb_cut, k=self.memb_k_used,
-                                       r0=self.ring_r0, dr=self.ring_dr)
+                                       r0=self.ring_r0, dr=self.ring_dr, overwrite=True)
 
     def write_membrane(self, filename):
         """Writes the membrane nodes as HETATM records (residue NE1, chain Q) for visualization.
@@ -143,6 +145,14 @@ class ExENCoM(ENCoM):
                 fh.write("HETATM{0:>5d}  Q1  NE1 Q{1:>4d}    {2:8.3f}{3:8.3f}{4:8.3f}  1.00  0.00           Q\n".format(
                     (i + 1) % 100000, (i + 1) % 10000, x, y, z))
             fh.write("END\n")
+
+    def _sum_hessians(self):
+        # sums in place into V1_H instead of allocating temporaries (the terms are discarded in build_hessian)
+        h = self.V1_H
+        h += self.V2_H
+        h += self.V3_H
+        h += self.V4_H
+        return h
 
     def _get_mass_xyz(self):
         return np.array([m[:3] for m in self.mol.masses], dtype=float)
@@ -265,19 +275,24 @@ def _intra_hessian(X, cutoff, k):
     return H.reshape(3 * n, 3 * n)
 
 
-def _coupling(A, B, cutoff, k):
-    """Returns the off-diagonal coupling block F (3nA x 3nB) between A and B and the contribution of these springs to
-    the diagonal blocks of A (3nA x 3nA).
+def _coupling(A, B, cutoff, k, with_F=True):
+    """Returns the off-diagonal coupling block F (3nA x 3nB) between A and B (None if not with_F) and the contribution
+    of these springs to the diagonal 3x3 blocks of A (nA x 3 x 3).
     """
     nA, nB = len(A), len(B)
-    F = np.zeros((nA, 3, nB, 3))
     ia, ib, blocks = _spring_blocks(A, B, cutoff, k)
-    F[ia, :, ib, :] = -blocks
     diag = np.zeros((nA, 3, 3))
     np.add.at(diag, ia, blocks)
-    D = np.zeros((nA, 3, nA, 3))
-    D[np.arange(nA), :, np.arange(nA), :] = diag
-    return F.reshape(3 * nA, 3 * nB), D.reshape(3 * nA, 3 * nA)
+    if not with_F:
+        return None, diag
+    F = np.zeros((nA, 3, nB, 3))
+    F[ia, :, ib, :] = -blocks
+    return F.reshape(3 * nA, 3 * nB), diag
+
+
+def _add_diag_blocks(H, diag):
+    n = len(diag)
+    H.reshape(n, 3, n, 3)[np.arange(n), :, np.arange(n), :] += diag
 
 
 def ring_labels(prot_xyz, memb_xyz, r0=20., dr=20.):
@@ -311,7 +326,7 @@ def ring_labels(prot_xyz, memb_xyz, r0=20., dr=20.):
     return np.unique(labels, return_inverse=True)[1].reshape(-1) + 1
 
 
-def reduce_membrane_hessian(h_prot, prot_xyz, memb_xyz, cutoff=15., k=1., r0=20., dr=20.):
+def reduce_membrane_hessian(h_prot, prot_xyz, memb_xyz, cutoff=15., k=1., r0=20., dr=20., overwrite=False):
     """Integrates the membrane out of the protein-membrane Hessian with the recursive formula of Zhang et al. 2021.
 
     With the protein as layer 0 and the membrane rings as layers 1 to l, the Hessian is block tridiagonal with
@@ -326,6 +341,7 @@ def reduce_membrane_hessian(h_prot, prot_xyz, memb_xyz, cutoff=15., k=1., r0=20.
         k (float, optional): Spring constant of the membrane springs.
         r0 (float, optional): Width of the first ring (Å).
         dr (float, optional): Width of the outer rings (Å).
+        overwrite (bool, optional): If True, h_prot is modified in place to save memory.
 
     Returns:
         numpy.ndarray: The reduced protein Hessian (3n x 3n).
@@ -335,12 +351,18 @@ def reduce_membrane_hessian(h_prot, prot_xyz, memb_xyz, cutoff=15., k=1., r0=20.
     reduced = None
     for i in reversed(range(len(layers))):
         X = layers[i]
-        H = h_prot.copy() if i == 0 else _intra_hessian(X, cutoff, k)
-        if i > 0:
-            H += _coupling(X, layers[i - 1], cutoff, k)[1]
+        if i == 0:
+            H = h_prot if overwrite else h_prot.copy()
+        else:
+            H = _intra_hessian(X, cutoff, k)
+            _add_diag_blocks(H, _coupling(X, layers[i - 1], cutoff, k, with_F=False)[1])
         if reduced is not None:
-            F, D = _coupling(X, layers[i + 1], cutoff, k)
-            H += D
-            H -= np.dot(F, np.linalg.solve(reduced, F.T))
-        reduced = (H + H.T) / 2.
+            F, diag = _coupling(X, layers[i + 1], cutoff, k)
+            _add_diag_blocks(H, diag)
+            # F S^-1 F^T computed as Y^T Y with S = L L^T and Y = L^-1 F^T, which keeps H symmetric without a copy
+            Y = np.linalg.solve(np.linalg.cholesky(reduced), F.T)
+            del F
+            H -= np.dot(Y.T, Y)
+            del Y
+        reduced = H
     return reduced
